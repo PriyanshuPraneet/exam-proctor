@@ -7,7 +7,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   CheckIcon,
-  ExclamationTriangleIcon, // Added icon
+  ExclamationTriangleIcon,
 } from "@heroicons/react/24/outline";
 
 const API_BASE_URL = "http://localhost:5000/api/exams";
@@ -19,16 +19,15 @@ const ExamTakerPage = () => {
   const navigate = useNavigate();
   const location = useLocation();
 
-  const examCode =
-    location.state?.examCode || sessionStorage.getItem("examCode");
+  const examCode = location.state?.examCode || sessionStorage.getItem("examCode");
 
   const fullscreenRef = useRef(null);
   const videoRef = useRef(null);
   
-  // NEW: Refs for ML Service
+  // Refs for ML Service
   const wsRef = useRef(null);
   const canvasRef = useRef(document.createElement("canvas")); 
-  const lastLogTimeRef = useRef(0); // To debounce backend calls
+  const lastLogTimeRef = useRef(0);
 
   const cameraStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
@@ -44,44 +43,61 @@ const ExamTakerPage = () => {
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   
-  // NEW: State for ML Alerts
+  // State for ML Alerts
   const [mlAlert, setMlAlert] = useState(null); 
+  const [mlAlertType, setMlAlertType] = useState("warning"); // NEW: Tracks color (warning vs violation)
 
-  /* =========================
-     ML SERVICE INTEGRATION
-  ========================= */
   /* =========================
      ML SERVICE INTEGRATION
   ========================= */
   const startMLMonitoring = () => {
-    console.log("🔄 Attempting to connect to ML Service..."); // DEBUG
+    console.log("🔄 Attempting to connect to ML Service...");
     wsRef.current = new WebSocket(ML_WS_URL);
 
     wsRef.current.onopen = () => {
-      console.log("✅ WebSocket Connected to ML Service"); // DEBUG
+      console.log("✅ WebSocket Connected to ML Service");
     };
 
     wsRef.current.onmessage = (event) => {
       const response = JSON.parse(event.data);
-      // DEBUG: See exactly what Python is sending back
-      console.log("📩 ML Response:", response); 
-
-      if (response.status === "violation") {
-        const violationText = response.alerts.join(", ");
-        setMlAlert(violationText);
+      
+      if (response.status === "violation" || response.status === "warning") {
         
+        // 1. Identify what type of issue we are dealing with
+        const isGazeIssue = response.alerts.some(a => a.includes("SUSPICIOUS_GAZE"));
+        const isFaceMissing = response.alerts.some(a => a.includes("FACE_NOT_VISIBLE"));
+        const isHardViolation = response.status === "violation";
+
+        // 2. Set the color state
+        setMlAlertType(response.status); 
+
+        // 3. Format the display text politely
+        let displayText = "";
+        if (isHardViolation && !isFaceMissing) {
+            // For phones, multiple people, etc.
+            displayText = response.alerts.filter(a => !a.includes("SUSPICIOUS_GAZE")).join(", ");
+        } else if (isFaceMissing) {
+            displayText = "Face not visible. Please stay in front of the camera.";
+        } else if (isGazeIssue) {
+            displayText = "Please focus on the screen.";
+        }
+
+        setMlAlert(displayText);
+        
+        // 4. Log the raw alert to the DB (Debounced)
         const now = Date.now();
         if (now - lastLogTimeRef.current > 5000) {
-          handleViolation(violationText);
+          handleViolation(response.alerts[0]); 
           lastLogTimeRef.current = now;
         }
       } else {
+        // Status is "clean"
         setMlAlert(null);
       }
     };
 
     wsRef.current.onerror = (err) => console.error("❌ ML WS Error:", err);
-    wsRef.current.onclose = () => console.log("🔌 ML WS Connection Closed"); // DEBUG
+    wsRef.current.onclose = () => console.log("🔌 ML WS Connection Closed");
     
     const intervalId = setInterval(() => {
       sendFrameToML();
@@ -94,22 +110,10 @@ const ExamTakerPage = () => {
   };
 
   const sendFrameToML = () => {
-    // Check if everything is ready
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      console.warn("⚠️ WebSocket not open. Skipping frame."); // DEBUG
-      return;
-    }
-    if (!videoRef.current) {
-      console.warn("⚠️ Video ref is null. Skipping frame."); // DEBUG
-      return;
-    }
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+    if (!videoRef.current || videoRef.current.videoWidth === 0) return;
 
     const video = videoRef.current;
-    if (video.videoWidth === 0 || video.videoHeight === 0) {
-      console.warn("⚠️ Video has 0 dimensions (Camera loading?)."); // DEBUG
-      return;
-    }
-
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
 
@@ -118,13 +122,7 @@ const ExamTakerPage = () => {
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
     canvas.toBlob((blob) => {
-      if (blob) {
-        // DEBUG: Confirm we are actually generating data
-        console.log(`📤 Sending Frame: ${blob.size} bytes`); 
-        wsRef.current.send(blob);
-      } else {
-        console.error("❌ Failed to create Blob from canvas"); // DEBUG
-      }
+      if (blob) wsRef.current.send(blob);
     }, "image/jpeg", 0.7);
   };
 
@@ -133,7 +131,7 @@ const ExamTakerPage = () => {
   ========================= */
   const startCamera = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480 }, // Optimize resolution for ML
+      video: { width: 640, height: 480 },
       audio: false,
     });
 
@@ -187,10 +185,7 @@ const ExamTakerPage = () => {
       await startScreenShare();
       await fullscreenRef.current.requestFullscreen();
       setIsFullscreen(true);
-      
-      // START ML MONITORING HERE
       startMLMonitoring();
-      
     } catch (err) {
       alert(err.message || "Permission denied");
       stopCamera();
@@ -207,10 +202,8 @@ const ExamTakerPage = () => {
         handleViolation("EXIT_FULLSCREEN");
       }
     };
-
     document.addEventListener("fullscreenchange", onFullscreenChange);
-    return () =>
-      document.removeEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, [exam, isSubmitted]);
 
   /* =========================
@@ -278,7 +271,6 @@ const ExamTakerPage = () => {
     return () => {
       stopCamera();
       stopScreenShare();
-      // Clean up WebSocket
       if (wsRef.current) wsRef.current.close();
     };
   }, [examCode]);
@@ -322,8 +314,12 @@ const ExamTakerPage = () => {
         alert("Maximum violations reached. Exam submitted.");
         handleSubmit(true);
       } else {
-        // We rely on the Overlay for ML alerts, but standard alert for others
-        if (!type.includes("PHONE") && !type.includes("MULTIPLE")) {
+        // Prevent intrusive popups for minor warnings or ML detections
+        // The UI overlay handles ML warnings visually.
+        const silentTypes = ["SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE", "PHONE", "MULTIPLE"];
+        const isSilent = silentTypes.some(silentType => type.includes(silentType));
+        
+        if (!isSilent) {
              alert(`⚠️ Violation detected: ${type}`);
         }
       }
@@ -395,10 +391,15 @@ const ExamTakerPage = () => {
       {/* --- ML ALERT OVERLAY --- */}
       {mlAlert && (
         <div className="fixed top-4 left-1/2 transform -translate-x-1/2 z-[60] animate-pulse">
-           <div className="bg-red-600 text-white px-6 py-4 rounded shadow-2xl flex items-center gap-3 border-4 border-white">
+           <div className={`text-white px-6 py-4 rounded shadow-2xl flex items-center gap-3 border-4 border-white ${
+               mlAlertType === "violation" ? "bg-red-600" : "bg-orange-500"
+             }`}
+           >
              <ExclamationTriangleIcon className="w-8 h-8" />
              <div>
-               <h3 className="font-bold text-lg">PROCTORING ALERT</h3>
+               <h3 className="font-bold text-lg">
+                 {mlAlertType === "violation" ? "PROCTORING ALERT" : "WARNING"}
+               </h3>
                <p>{mlAlert}</p>
              </div>
            </div>
@@ -420,7 +421,11 @@ const ExamTakerPage = () => {
       <video
         ref={videoRef}
         className={`fixed bottom-4 right-4 w-48 h-36 bg-black rounded z-40 object-cover transition-all duration-300 ${
-            mlAlert ? "border-4 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.8)]" : "border border-gray-300"
+            mlAlert 
+              ? mlAlertType === "violation" 
+                ? "border-4 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.8)]" 
+                : "border-4 border-orange-500 shadow-[0_0_20px_rgba(249,115,22,0.8)]"
+              : "border border-gray-300"
         }`}
       />
 
