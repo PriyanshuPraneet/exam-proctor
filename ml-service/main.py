@@ -1,18 +1,18 @@
-# ml-service/main.py
 import cv2
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from core.object_detector import ObjectDetector
+from core.gaze_tracker import GazeTracker 
 
 app = FastAPI()
 
-# Initialize the Object Detector
-# Ensure 'best.pt' is inside the 'models' folder
+# Initialize the Object Detector and Gaze Tracker
 try:
     detector = ObjectDetector("models/best.pt")
+    gaze_tracker = GazeTracker()           
+    print("✅ ML Models loaded successfully.")
 except Exception as e:
     print(f"❌ Critical Error: Could not load model. {e}")
-    # We don't exit here to allow server to start, but it won't work correctly.
 
 @app.websocket("/ws/monitor")
 async def websocket_endpoint(websocket: WebSocket):
@@ -31,27 +31,45 @@ async def websocket_endpoint(websocket: WebSocket):
             if frame is None:
                 continue
 
-            # 3. Run Inference using our Core Module
+            # 3. Run Inference using our Core Modules
             analysis = detector.predict(frame)
+            gaze_direction, pitch, yaw = gaze_tracker.predict(frame)
+            
+            # Attach gaze data to the analysis payload
+            analysis['gaze_direction'] = gaze_direction
+            analysis['pitch'] = round(pitch, 2)
+            analysis['yaw'] = round(yaw, 2)
             
             # 4. Determine Status
             status = "clean"
             alerts = []
 
             # Logic: Phone Detected
-            if analysis['phone_detected']:
+            if analysis.get('phone_detected'):
                 status = "violation"
                 alerts.append("PHONE_DETECTED")
             
             # Logic: Multiple People
-            if analysis['person_count'] > 1:
+            if analysis.get('person_count', 0) > 1:
                 status = "violation"
                 alerts.append("MULTIPLE_PERSONS")
 
-            # Logic: No Person (Optional warning)
-            if analysis['person_count'] == 0:
+            # Logic: No Person
+            if analysis.get('person_count', 0) == 0:
                 status = "warning"
                 alerts.append("NO_FACE_DETECTED")
+                
+            # Logic: Suspicious Gaze (Immediate trigger)
+            if gaze_direction in ["LOOKING_LEFT", "LOOKING_RIGHT", "LOOKING_DOWN", "LOOKING_UP"]:
+                if status == "clean":
+                    status = "warning"
+                alerts.append(f"SUSPICIOUS_GAZE: {gaze_direction}")
+                
+            # Logic: MediaPipe lost face, but YOLO sees a person
+            if gaze_direction == "NO_FACE" and analysis.get('person_count', 0) > 0:
+                 if status == "clean":
+                     status = "warning"
+                 alerts.append("FACE_NOT_VISIBLE")
 
             # 5. Send Response
             await websocket.send_json({

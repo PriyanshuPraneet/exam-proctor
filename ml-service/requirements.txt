@@ -4,3 +4,6 @@ ultralytics
 opencv-python-headless
 numpy
 websockets
+opencv-python
+mediapipe
+protobuf==3.20.3
