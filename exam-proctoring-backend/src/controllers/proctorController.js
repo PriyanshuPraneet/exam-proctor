@@ -1,5 +1,20 @@
-// controllers/proctorController.js
 import ProctorLog from "../models/ProctorLog.js";
+
+/* =========================
+   STRIKE-WORTHY VIOLATION TYPES
+   Only these event types count toward the 3-strike limit.
+   Everything else is logged for the organizer but does NOT
+   increment the strike counter shown to the frontend.
+========================= */
+const STRIKE_TYPES = new Set([
+  "EXIT_FULLSCREEN",
+  "TAB_SWITCH",
+  "WINDOW_BLUR",
+  "SCREEN_SHARE_STOPPED",
+  "PHONE_DETECTED",
+  "MULTIPLE_PERSONS",
+  // GAZE_STRIKE removed — gaze is warning only, not a strike
+]);
 
 /* =========================
    CANDIDATE: LOG VIOLATION
@@ -25,6 +40,7 @@ export const logViolation = async (req, res) => {
       });
     }
 
+    // Always log the event (organizer can see full history)
     log.events.push({
       type,
       timestamp: new Date(),
@@ -32,10 +48,14 @@ export const logViolation = async (req, res) => {
 
     await log.save();
 
+    // Only count events that are in the STRIKE_TYPES set
+    const strikes = log.events.filter(e => STRIKE_TYPES.has(e.type)).length;
+
     return res.json({
       message: "Violation logged",
-      strikes: log.events.length,
+      strikes,             // ← Frontend uses this to trigger auto-submit at 3
       lastEvent: type,
+      isStrike: STRIKE_TYPES.has(type),
     });
   } catch (error) {
     console.error("Proctor log error:", error);

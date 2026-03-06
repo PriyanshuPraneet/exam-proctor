@@ -33,6 +33,10 @@ const ExamTakerPage = () => {
   const screenStreamRef = useRef(null);
   const startCalledRef = useRef(false);
 
+  // Debounce ref for WINDOW_BLUR — prevents false triggers from alert() popups
+  // and OS notifications. Only fires if window stays blurred for > 1 second.
+  const blurTimeoutRef = useRef(null);
+
   const [exam, setExam] = useState(null);
   const [answers, setAnswers] = useState({});
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
@@ -45,7 +49,7 @@ const ExamTakerPage = () => {
   
   // State for ML Alerts
   const [mlAlert, setMlAlert] = useState(null); 
-  const [mlAlertType, setMlAlertType] = useState("warning"); // NEW: Tracks color (warning vs violation)
+  const [mlAlertType, setMlAlertType] = useState("warning"); // Tracks color (warning vs violation)
 
   /* =========================
      ML SERVICE INTEGRATION
@@ -64,7 +68,7 @@ const ExamTakerPage = () => {
       if (response.status === "violation" || response.status === "warning") {
         
         // 1. Identify what type of issue we are dealing with
-        const isGazeIssue = response.alerts.some(a => a.includes("SUSPICIOUS_GAZE"));
+        const isGazeIssue = response.alerts.some(a => a.includes("SUSPICIOUS_GAZE") || a.includes("GAZE_STRIKE"));
         const isFaceMissing = response.alerts.some(a => a.includes("FACE_NOT_VISIBLE"));
         const isHardViolation = response.status === "violation";
 
@@ -73,22 +77,36 @@ const ExamTakerPage = () => {
 
         // 3. Format the display text politely
         let displayText = "";
-        if (isHardViolation && !isFaceMissing) {
-            // For phones, multiple people, etc.
-            displayText = response.alerts.filter(a => !a.includes("SUSPICIOUS_GAZE")).join(", ");
+        if (isHardViolation && !isFaceMissing && !isGazeIssue) {
+          // For phones, multiple people, etc.
+          displayText = response.alerts.filter(a => !a.includes("SUSPICIOUS_GAZE") && !a.includes("GAZE_STRIKE")).join(", ");
         } else if (isFaceMissing) {
-            displayText = "Face not visible. Please stay in front of the camera.";
+          displayText = "Face not visible. Please stay in front of the camera.";
         } else if (isGazeIssue) {
-            displayText = "Please focus on the screen.";
+          displayText = "Please focus on the screen.";
         }
 
         setMlAlert(displayText);
         
-        // 4. Log the raw alert to the DB (Debounced)
-        const now = Date.now();
-        if (now - lastLogTimeRef.current > 5000) {
-          handleViolation(response.alerts[0]); 
-          lastLogTimeRef.current = now;
+        // 4. Log alerts to DB
+        //
+        // PHONE_DETECTED / MULTIPLE_PERSONS → log immediately (hard strikes)
+        // GAZE_STRIKE / SUSPICIOUS_GAZE / FACE_NOT_VISIBLE → debounced every 5s (warning only, no strike)
+        //
+        const hasPhoneDetected = response.alerts.includes("PHONE_DETECTED");
+        const hasMultiplePersons = response.alerts.includes("MULTIPLE_PERSONS");
+
+        if (hasPhoneDetected) {
+          handleViolation("PHONE_DETECTED");
+        } else if (hasMultiplePersons) {
+          handleViolation("MULTIPLE_PERSONS");
+        } else {
+          // Gaze warnings + face warnings — debounced, logged for organizer only (not strikes)
+          const now = Date.now();
+          if (now - lastLogTimeRef.current > 5000) {
+            handleViolation(response.alerts[0]);
+            lastLogTimeRef.current = now;
+          }
         }
       } else {
         // Status is "clean"
@@ -219,15 +237,29 @@ const ExamTakerPage = () => {
     };
 
     const handleBlur = () => {
-      handleViolation("WINDOW_BLUR");
+      // Debounce: only log WINDOW_BLUR if window stays blurred for > 1 second.
+      blurTimeoutRef.current = setTimeout(() => {
+        handleViolation("WINDOW_BLUR");
+      }, 1000);
+    };
+
+    const handleFocus = () => {
+      // Cancel if refocused within 1 second
+      if (blurTimeoutRef.current) {
+        clearTimeout(blurTimeoutRef.current);
+        blurTimeoutRef.current = null;
+      }
     };
 
     document.addEventListener("visibilitychange", handleVisibility);
     window.addEventListener("blur", handleBlur);
+    window.addEventListener("focus", handleFocus);
 
     return () => {
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("blur", handleBlur);
+      window.removeEventListener("focus", handleFocus);
+      if (blurTimeoutRef.current) clearTimeout(blurTimeoutRef.current);
     };
   }, [exam, isSubmitted]);
 
@@ -314,13 +346,15 @@ const ExamTakerPage = () => {
         alert("Maximum violations reached. Exam submitted.");
         handleSubmit(true);
       } else {
-        // Prevent intrusive popups for minor warnings or ML detections
-        // The UI overlay handles ML warnings visually.
-        const silentTypes = ["SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE", "PHONE", "MULTIPLE"];
-        const isSilent = silentTypes.some(silentType => type.includes(silentType));
+        // Silent types — UI overlay handles visual feedback, no alert() popup
+        const silentTypes = [
+          "SUSPICIOUS_GAZE", "FACE_NOT_VISIBLE", "NO_FACE",
+          "WINDOW_BLUR", "GAZE_STRIKE", "PHONE", "MULTIPLE",
+        ];
+        const isSilent = silentTypes.some(s => type.includes(s));
         
         if (!isSilent) {
-             alert(`⚠️ Violation detected: ${type}`);
+          alert(`⚠️ Violation detected: ${type}`);
         }
       }
     } catch (err) {

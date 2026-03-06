@@ -4,7 +4,6 @@ import axios from 'axios';
 
 import CandidateDashboard from '../components/CandidateDashboard';
 import OrganizerDashboard from '../components/OrganizerDashboard';
-import JoinExamForm from '../components/JoinExamForm';
 import CreateExamForm from '../components/CreateExamForm';
 import Profile from './Profile';
 
@@ -15,7 +14,6 @@ import {
   ChartBarIcon,
   ArrowLeftOnRectangleIcon,
   PlusCircleIcon,
-  PlayIcon,
 } from '@heroicons/react/24/outline';
 
 const API_BASE_URL = 'http://localhost:5000/api';
@@ -153,7 +151,6 @@ const Dashboard = () => {
     user.role === 'candidate'
       ? [
           { name: 'Dashboard', icon: ChartBarIcon },
-          { name: 'Join Exam', icon: PlayIcon },
           { name: 'Upcoming Exams', icon: CalendarDaysIcon },
           { name: 'Past Results', icon: DocumentTextIcon },
           { name: 'Profile', icon: UserCircleIcon },
@@ -194,8 +191,6 @@ const Dashboard = () => {
               view="past"
             />
           );
-        case 'Join Exam':
-          return <JoinExamForm />;
         case 'Profile':
           return <Profile />;
         default:
