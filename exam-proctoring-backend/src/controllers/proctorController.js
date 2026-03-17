@@ -1,11 +1,6 @@
 import ProctorLog from "../models/ProctorLog.js";
+import BehaviorAnalysis from "../models/BehaviorAnalysis.js";
 
-/* =========================
-   STRIKE-WORTHY VIOLATION TYPES
-   Only these event types count toward the 3-strike limit.
-   Everything else is logged for the organizer but does NOT
-   increment the strike counter shown to the frontend.
-========================= */
 const STRIKE_TYPES = new Set([
   "EXIT_FULLSCREEN",
   "TAB_SWITCH",
@@ -13,12 +8,9 @@ const STRIKE_TYPES = new Set([
   "SCREEN_SHARE_STOPPED",
   "PHONE_DETECTED",
   "MULTIPLE_PERSONS",
-  // GAZE_STRIKE removed — gaze is warning only, not a strike
+  "NO_FACE_DETECTED",   // Candidate left the camera view
 ]);
 
-/* =========================
-   CANDIDATE: LOG VIOLATION
-========================= */
 export const logViolation = async (req, res) => {
   try {
     const { examId, type } = req.body;
@@ -40,7 +32,6 @@ export const logViolation = async (req, res) => {
       });
     }
 
-    // Always log the event (organizer can see full history)
     log.events.push({
       type,
       timestamp: new Date(),
@@ -48,12 +39,11 @@ export const logViolation = async (req, res) => {
 
     await log.save();
 
-    // Only count events that are in the STRIKE_TYPES set
     const strikes = log.events.filter(e => STRIKE_TYPES.has(e.type)).length;
 
     return res.json({
       message: "Violation logged",
-      strikes,             // ← Frontend uses this to trigger auto-submit at 3
+      strikes,
       lastEvent: type,
       isStrike: STRIKE_TYPES.has(type),
     });
@@ -79,6 +69,62 @@ export const getProctorLogsByExam = async (req, res) => {
     console.error("Fetch proctor logs error:", error);
     res.status(500).json({
       message: "Failed to fetch proctor logs",
+    });
+  }
+};
+
+/* =========================
+   CANDIDATE: SAVE BEHAVIOR ANALYSIS
+========================= */
+export const saveBehaviorAnalysis = async (req, res) => {
+  try {
+    const { examId, isSuspicious, confidence, riskLevel, summary } = req.body;
+    const candidateId = req.user._id;
+
+    if (!examId || confidence === undefined || !riskLevel) {
+      return res.status(400).json({
+        message: "examId, confidence, and riskLevel are required",
+      });
+    }
+
+    const result = await BehaviorAnalysis.findOneAndUpdate(
+      { examId, candidateId },
+      {
+        isSuspicious,
+        confidence,
+        riskLevel,
+        summary: summary || "",
+        analyzedAt: new Date(),
+      },
+      { upsert: true, new: true }
+    );
+
+    return res.json({
+      message: "Behavior analysis saved",
+      result,
+    });
+  } catch (error) {
+    console.error("Save behavior analysis error:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+/* =========================
+   ORGANIZER: GET BEHAVIOR ANALYSIS BY EXAM
+========================= */
+export const getBehaviorAnalysisByExam = async (req, res) => {
+  try {
+    const { examId } = req.params;
+
+    const analyses = await BehaviorAnalysis.find({ examId })
+      .populate("candidateId", "name email")
+      .sort({ analyzedAt: 1 });
+
+    res.json(analyses);
+  } catch (error) {
+    console.error("Fetch behavior analysis error:", error);
+    res.status(500).json({
+      message: "Failed to fetch behavior analysis",
     });
   }
 };

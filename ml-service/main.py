@@ -1,15 +1,28 @@
 import cv2
 import time
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from core.object_detector import ObjectDetector
 from core.gaze_tracker import GazeTracker
+from core.behavior_analyzer import BehaviorAnalyzer, encode_frame_features
 
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"], # Vite dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initialize models separately so a failure in one doesn't kill the other
 detector = None
 gaze_tracker = None
+behavior_analyzer = None
 
 try:
     detector = ObjectDetector("models/best.pt")
@@ -23,8 +36,18 @@ try:
 except Exception as e:
     print(f"❌ Gaze Tracker failed to load: {e}")
 
+try:
+    behavior_analyzer = BehaviorAnalyzer()
+    print("✅ Behavior Analyzer loaded.")
+except Exception as e:
+    print(f"❌ Behavior Analyzer failed to load: {e}")
+
 # How many continuous seconds of looking away before a GAZE_STRIKE is issued
 GAZE_STRIKE_THRESHOLD_SECONDS = 5
+
+# In-memory store for behavior analysis results
+# Key: (examId, candidateId) → prediction dict
+behavior_results = {}
 
 
 @app.websocket("/ws/monitor")
@@ -32,9 +55,17 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     print(f"🔌 Client Connected: {websocket.client}")
 
+    # ── Parse session identifiers from query params ──
+    exam_id = websocket.query_params.get("examId", "unknown")
+    candidate_id = websocket.query_params.get("candidateId", "unknown")
+    print(f"📋 Session: examId={exam_id}, candidateId={candidate_id}")
+
     # Per-connection gaze timer state — resets on every new WS connection
     gaze_away_since = None
     gaze_strike_issued = False
+
+    # Per-connection feature buffer for LSTM behavioral analysis
+    feature_buffer = []
 
     try:
         while True:
@@ -111,6 +142,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         status = "warning"
                     alerts.append("FACE_NOT_VISIBLE")
 
+            # ── Accumulate features for LSTM ───────────────────────────────────
+            features = encode_frame_features(analysis)
+            feature_buffer.append(features)
+
             # 5. Send Response
             await websocket.send_json({
                 "status": status,
@@ -126,3 +161,31 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+
+    # ── Run LSTM analysis on disconnect ────────────────────────────────────
+    if behavior_analyzer is not None and len(feature_buffer) > 0:
+        try:
+            prediction = behavior_analyzer.predict(feature_buffer)
+            behavior_results[(exam_id, candidate_id)] = prediction
+            print(f"🧠 Behavior analysis for ({exam_id}, {candidate_id}): "
+                  f"risk={prediction['risk_level']}, confidence={prediction['confidence']}")
+        except Exception as e:
+            print(f"⚠️ Behavior analysis failed: {e}")
+    else:
+        print(f"⚠️ Skipped behavior analysis: analyzer={'loaded' if behavior_analyzer else 'missing'}, frames={len(feature_buffer)}")
+
+
+# ── REST endpoint for behavior report ──────────────────────────────────────────
+@app.get("/api/behavior-report/{exam_id}/{candidate_id}")
+async def get_behavior_report(exam_id: str, candidate_id: str):
+    """
+    Returns the LSTM behavior analysis result for a specific candidate in an exam.
+    Called by the frontend after exam submission.
+    """
+    key = (exam_id, candidate_id)
+    result = behavior_results.get(key)
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="No behavior report found for this session.")
+
+    return JSONResponse(content=result)
