@@ -1,180 +1,277 @@
+# core/gaze_tracker.py
 import cv2
 import numpy as np
-import onnxruntime as ort
-import time
-import csv
-from datetime import datetime
-import os
+import mediapipe as mp
 
-# --- CONFIGURATION ---
-# Use absolute path resolving so it works no matter where main.py is run from
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(CURRENT_DIR, "..", "models", "resnet18_gaze.onnx")
-INPUT_SIZE = (448, 448)
+# ── Safe-zone leniency ────────────────────────────────────────────────────────
+# How much to expand the calibrated zone outward on each side (as a fraction
+# of the measured span). Increase for more tolerance, decrease for strictness.
+YAW_LENIENCY   = 0.30
+PITCH_LENIENCY = 0.20
 
-# ⚠️ ULTRA-STRICT MODE: Negative padding shrinks the safe zone inside the monitor
-LENIENCY_FACTOR = -0.05 
 
 class GazeTracker:
-    def __init__(self, model_path=MODEL_PATH):
-        print(f"Loading Gaze Model from: {model_path}")
-        try:
-            self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
-            self.input_name = self.session.get_inputs()[0].name
-        except Exception as e:
-            print(f"❌ Error loading Gaze model: {e}")
-            raise e
+    def __init__(self):
+        print("🚀 Initializing Robust Gaze Tracker...")
 
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        
-        # --- DYNAMIC CALIBRATION STATE ---
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh    = self.mp_face_mesh.FaceMesh(
+            refine_landmarks=True,          # MUST be True — iris points 469-477 only exist here
+            max_num_faces=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+        self.prev_pitch = None
+        self.prev_yaw   = None
+        # ── EMA weight on NEW value.
+        # 0.25 = heavy smoothing (good for stable gaze reading).
+        # Lower = more lag but less flicker. Don't go above 0.4.
+        self.alpha = 0.25
+
         self.is_calibrated = False
-        self.calib_states = ["PROMPT_LEFT", "PROMPT_RIGHT", "PROMPT_UP", "PROMPT_DOWN", "PROCTORING"]
-        self.current_state_idx = 0
-        
-        self.calibration_data = {'LEFT': [], 'RIGHT': [], 'UP': [], 'DOWN': []}
+        self.safe_zone     = {}
+        self.calib_buffer  = {}
+
+        # Majority-vote window.
+        # 5 frames, require 3/5 agreement — suppresses noise while still
+        # reacting within ~150 ms at 30 fps.
+        self.gaze_history = []
+        self.history_size = 3
+
+    # ── Landmark indices ──────────────────────────────────────────────────────
+    # Iris indices are only present when refine_landmarks=True (478-point mesh)
+    LEFT_IRIS  = [474, 475, 476, 477]
+    RIGHT_IRIS = [469, 470, 471, 472]
+    LEFT_EYE   = [33,  133]   # medial / lateral canthus
+    RIGHT_EYE  = [362, 263]   # medial / lateral canthus
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _get_landmarks(self, frame):
+        """Return the first face landmark object, or None if no face found."""
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.face_mesh.process(rgb)
+        if not result.multi_face_landmarks:
+            return None
+        return result.multi_face_landmarks[0]
+
+    def _iris_center(self, lm, indices, w, h):
+        """Mean pixel position of the given iris landmark ring."""
+        pts = [(lm.landmark[i].x * w, lm.landmark[i].y * h) for i in indices]
+        return np.mean(pts, axis=0)
+
+    def _eye_corners(self, lm, indices, w, h):
+        """Pixel positions of two eye-corner landmarks."""
+        return [(lm.landmark[i].x * w, lm.landmark[i].y * h) for i in indices]
+
+    def _compute_gaze(self, frame):
+        """
+        Compute (pitch, yaw) from a BGR frame.
+
+        ── Flip contract ────────────────────────────────────────────────────
+        This method operates on the frame EXACTLY as given.  The caller is
+        responsible for flipping before calling if a mirror view is needed.
+        Both add_calibration_frame() and predict() flip the frame themselves
+        BEFORE calling _compute_gaze(), so calibration and monitoring are
+        always measured on the same orientation.  Previously predict() flipped
+        but add_calibration_frame() did not — that mismatch caused the safe
+        zone computed during calibration to be the mirror image of what the
+        monitor saw, making the tracker systematically wrong.
+
+        ── Yaw ──────────────────────────────────────────────────────────────
+        Iris horizontal ratio within the eye socket (0 = medial, 1 = lateral).
+        Averaged over both eyes for robustness.
+
+        ── Pitch ────────────────────────────────────────────────────────────
+        Vertical iris offset from the eye-corner midline, normalised by the
+        inter-canthus distance (eye width).  This removes the dependency on
+        camera distance and face size — the original /50 magic number broke
+        for people sitting close or far from the camera.
+
+        Returns (pitch, yaw) or (None, None) on failure.
+        """
+        h, w = frame.shape[:2]
+
+        lm = self._get_landmarks(frame)
+        if lm is None:
+            return None, None
+
+        # Guard: refine_landmarks=True produces exactly 478 points.
+        if len(lm.landmark) < 478:
+            print(f"⚠️ Only {len(lm.landmark)} landmarks — iris unavailable.")
+            return None, None
+
+        try:
+            left_iris  = self._iris_center(lm, self.LEFT_IRIS,  w, h)
+            right_iris = self._iris_center(lm, self.RIGHT_IRIS, w, h)
+            left_eye   = self._eye_corners(lm, self.LEFT_EYE,   w, h)
+            right_eye  = self._eye_corners(lm, self.RIGHT_EYE,  w, h)
+
+            # ── Yaw ───────────────────────────────────────────────────────
+            left_eye_w = np.linalg.norm(np.array(left_eye[0]) - np.array(left_eye[1]))
+            right_eye_w = np.linalg.norm(np.array(right_eye[0]) - np.array(right_eye[1]))
+
+            # Degenerate frame — face too turned / eye occluded
+            if left_eye_w < 5.0 or right_eye_w < 5.0: # Increased threshold
+                return None, None
+
+            left_ratio = (left_iris[0] - left_eye[0][0]) / left_eye_w
+            right_ratio = (right_iris[0] - right_eye[0][0]) / right_eye_w
+            yaw = (left_ratio + right_ratio) / 2.0
+
+            # ── Pitch — normalised by eye width, not a magic pixel constant ──
+            # Using eye width as the normaliser makes pitch scale-invariant:
+            # the same physical gaze angle gives the same pitch value regardless
+            # of face size or camera distance.
+            left_mid_y = (left_eye[0][1] + left_eye[1][1]) / 2.0
+            right_mid_y = (right_eye[0][1] + right_eye[1][1]) / 2.0
+            left_v = (left_iris[1] - left_mid_y) / left_eye_w
+            right_v = (right_iris[1] - right_mid_y) / right_eye_w
+            pitch = (left_v + right_v) / 2.0
+
+            # ── EMA smoothing ─────────────────────────────────────────────
+            if self.prev_pitch is None:
+                self.prev_pitch = pitch
+                self.prev_yaw   = yaw
+            else:
+                pitch = self.alpha * pitch + (1.0 - self.alpha) * self.prev_pitch
+                yaw   = self.alpha * yaw   + (1.0 - self.alpha) * self.prev_yaw
+                self.prev_pitch = pitch
+                self.prev_yaw   = yaw
+
+            return float(pitch), float(yaw)
+
+        except Exception as e:
+            print(f"Gaze calculation error: {e}")
+            return None, None
+
+    # ── Calibration API ───────────────────────────────────────────────────────
+
+    def reset_calibration(self):
+        """Call between exam sessions so each student starts fresh."""
+        self.is_calibrated = False
+        self.safe_zone     = {}
+        self.calib_buffer  = {}
+        self.prev_pitch    = None
+        self.prev_yaw      = None
+        self.gaze_history  = []
+
+    def add_calibration_frame(self, frame, point_id: str):
+        """
+        Accumulate pitch/yaw readings for one calibration point.
+
+        ⚠️  Frame is flipped HERE (same as predict) so that calibration and
+        monitoring are always measured on the same mirror orientation.
+        Returns (face_detected, pitch, yaw).
+        """
+        # ── Flip before measuring — SAME orientation as predict() ────────
+        flipped = cv2.flip(frame, 1)
+        pitch, yaw = self._compute_gaze(flipped)
+        face_detected = pitch is not None
+
+        if not face_detected:
+            return False, 0.0, 0.0
+
+        if point_id not in self.calib_buffer:
+            self.calib_buffer[point_id] = {"pitches": [], "yaws": []}
+
+        self.calib_buffer[point_id]["pitches"].append(pitch)
+        self.calib_buffer[point_id]["yaws"].append(yaw)
+
+        return True, float(pitch), float(yaw)
+
+    def finalize_calibration(self) -> dict:
+        """
+        Compute the personalised safe zone from the 5-point buffer using
+        median values (robust to outlier frames).
+        """
+        buf = self.calib_buffer
+
+        def get_med(ids, key):
+            vals = []
+            for pid in ids:
+                if pid in buf:
+                    vals.extend(buf[pid][key])
+            return float(np.median(vals)) if vals else 0.0
+
+        # LEFT dots define yaw_min, RIGHT dots define yaw_max.
+        # TOP dots define pitch_min (eyes up = negative pitch), BOTTOM define pitch_max.
+        y_min = get_med(["TOP_LEFT",  "BOTTOM_LEFT"],  "yaws")
+        y_max = get_med(["TOP_RIGHT", "BOTTOM_RIGHT"], "yaws")
+        p_min = get_med(["TOP_LEFT",  "TOP_RIGHT"],    "pitches")
+        p_max = get_med(["BOTTOM_LEFT","BOTTOM_RIGHT"],"pitches")
+
+        # Ensure correct ordering regardless of head position during calibration
+        y_min, y_max = min(y_min, y_max), max(y_min, y_max)
+        p_min, p_max = min(p_min, p_max), max(p_min, p_max)
+
+        # Enforce a minimum span so a very steady user doesn't get a zero-size zone.
+        # With the normalised pitch formula, 0.05 is a reasonable minimum.
+        y_span = max(y_max - y_min, 0.25)
+        p_span = max(p_max - p_min, 0.15)
+
         self.safe_zone = {
-            'yaw_min': 0.0, 'yaw_max': 0.0, 
-            'pitch_min': 0.0, 'pitch_max': 0.0,
-            'yaw_pad': 0.0, 'pitch_pad': 0.0
+            "yaw_min":   y_min - (y_span * YAW_LENIENCY),
+            "yaw_max":   y_max + (y_span * YAW_LENIENCY),
+            "pitch_min": p_min - (p_span * PITCH_LENIENCY),
+            "pitch_max": p_max + (p_span * PITCH_LENIENCY),
         }
-        
-        self.frames_to_capture = 10
-        self.capture_counter = 0
-        self.is_capturing = False
 
-    def _preprocess(self, face_crop):
-        img = cv2.resize(face_crop, INPUT_SIZE)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        img = (img - mean) / std
-        img = img.transpose(2, 0, 1)
-        return np.expand_dims(img, axis=0).astype(np.float32)
+        self.is_calibrated = True
+        print("✅ Calibration finalised:", self.safe_zone)
+        return self.safe_zone
 
-    def _softmax(self, x):
-        e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
-        return e_x / e_x.sum(axis=1, keepdims=True)
+    def set_calibration(self, safe_zone: dict):
+        """Directly inject a pre-computed safe_zone (called from /ws/monitor)."""
+        if safe_zone:
+            self.safe_zone     = safe_zone
+            self.is_calibrated = True
+            print("🎯 Safe zone injected:", safe_zone)
+        else:
+            print("⚠️ Received empty safe zone — calibration not set.")
 
-    def _decode_gaze(self, yaw_logits, pitch_logits):
-        _bins = 90
-        _binwidth = 4
-        _angle_offset = 180
-        idx_tensor = np.arange(_bins, dtype=np.float32)
-        yaw_probs = self._softmax(yaw_logits)
-        pitch_probs = self._softmax(pitch_logits)
-        yaw = np.sum(yaw_probs * idx_tensor, axis=1) * _binwidth - _angle_offset
-        pitch = np.sum(pitch_probs * idx_tensor, axis=1) * _binwidth - _angle_offset
-        return np.radians(pitch[0]), np.radians(yaw[0])
+    # ── Proctoring prediction ─────────────────────────────────────────────────
 
     def predict(self, frame):
         """
-        Processes a single frame and returns the gaze status, pitch, and yaw.
-        Since this is running in a server environment, we bypass the manual Spacebar 
-        calibration and use a fast-tracked auto-calibration for the first few frames, 
-        or you can initialize it with default strict boundaries.
+        Returns (status, pitch, yaw).
+
+        Status values:
+            NO_FACE        — no face detected
+            NOT_CALIBRATED — face found but safe zone not set
+            FOCUSED        — gaze inside calibrated safe zone
+            LOOKING_LEFT / LOOKING_RIGHT / LOOKING_UP / LOOKING_DOWN
+
+        Frame is flipped here — same as add_calibration_frame — so both
+        always measure the same orientation.  All timing / strike logic lives
+        in main.py; this method only reports current gaze direction.
         """
-        # Flip frame horizontally for natural mirroring
-        frame = cv2.flip(frame, 1)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Optimize face detection for speed
-        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
-        
-        if len(faces) == 0:
+        # ── Flip — must match add_calibration_frame ───────────────────────
+        flipped    = cv2.flip(frame, 1)
+        pitch, yaw = self._compute_gaze(flipped)
+
+        if pitch is None:
+            self.gaze_history = []
             return "NO_FACE", 0.0, 0.0
 
-        # Get largest face
-        x, y, w, h = max(faces, key=lambda rect: rect[2] * rect[3])
-        pad = 40
-        x1, y1 = max(0, x - pad), max(0, y - pad)
-        x2, y2 = min(frame.shape[1], x + w + pad), min(frame.shape[0], y + h + pad)
-        face_crop = frame[y1:y2, x1:x2]
-
-        if face_crop.shape[0] <= 0 or face_crop.shape[1] <= 0:
-            return "NO_FACE", 0.0, 0.0
-
-        # Inference
-        input_tensor = self._preprocess(face_crop)
-        output_names = [out.name for out in self.session.get_outputs()]
-        outputs = self.session.run(output_names, {self.input_name: input_tensor})
-        pitch, yaw = self._decode_gaze(outputs[0], outputs[1])
-
-        # ---------------------------------------------------------
-        # SERVER-SIDE FAST CALIBRATION (Auto-centers on first frames)
-        # Because we can't press 'Spacebar' on the FastAPI server, 
-        # we assume the first 20 frames the user is looking at the screen.
-        # ---------------------------------------------------------
         if not self.is_calibrated:
-            self.calibration_data['UP'].append(pitch)
-            self.calibration_data['RIGHT'].append(yaw)
-            
-            if len(self.calibration_data['UP']) >= 20:
-                # Build a strict simulated bounding box based on their natural center
-                center_pitch = np.mean(self.calibration_data['UP'])
-                center_yaw = np.mean(self.calibration_data['RIGHT'])
-                
-                # Assuming typical screen width/height pupil movement ratios
-                self.safe_zone['yaw_min'] = center_yaw - 0.25
-                self.safe_zone['yaw_max'] = center_yaw + 0.25
-                self.safe_zone['pitch_min'] = center_pitch - 0.15
-                self.safe_zone['pitch_max'] = center_pitch + 0.20
-                
-                self.safe_zone['yaw_pad'] = (self.safe_zone['yaw_max'] - self.safe_zone['yaw_min']) * LENIENCY_FACTOR
-                self.safe_zone['pitch_pad'] = (self.safe_zone['pitch_max'] - self.safe_zone['pitch_min']) * LENIENCY_FACTOR
-                
-                self.is_calibrated = True
-                print("✅ Gaze Auto-Calibration Complete.")
-            
-            return "CALIBRATING", float(pitch), float(yaw)
+            return "NOT_CALIBRATED", float(pitch), float(yaw)
 
-        # ---------------------------------------------------------
-        # STRICT PROCTORING PHASE
-        # ---------------------------------------------------------
-        status = "FOCUSED"
-        
-        # Apply Boundaries with NEGATIVE padding (shrinks the box inward)
-        y_min = self.safe_zone['yaw_min'] - self.safe_zone['yaw_pad']
-        y_max = self.safe_zone['yaw_max'] + self.safe_zone['yaw_pad']
-        
-        # Shrink pitch even more to catch downward keyboard glances instantly
-        p_min = self.safe_zone['pitch_min'] - (self.safe_zone['pitch_pad'] * 1.5) 
-        p_max = self.safe_zone['pitch_max'] + self.safe_zone['pitch_pad']
-        
-        if yaw < y_min:
-            status = "LOOKING_LEFT"
-        elif yaw > y_max:
-            status = "LOOKING_RIGHT"
-        elif pitch < p_min:
-            status = "LOOKING_DOWN"
-        elif pitch > p_max:
-            status = "LOOKING_UP"
+        sz = self.safe_zone
 
-        return status, float(pitch), float(yaw)
+        # Raw direction from calibrated boundaries
+        if   yaw   < sz["yaw_min"]:   raw = "LOOKING_LEFT"
+        elif yaw   > sz["yaw_max"]:   raw = "LOOKING_RIGHT"
+        elif pitch < sz["pitch_min"]: raw = "LOOKING_UP"
+        elif pitch > sz["pitch_max"]: raw = "LOOKING_DOWN"
+        else:                         raw = "FOCUSED"
 
-# If you want to test it locally from the terminal without the FastAPI server:
-if __name__ == "__main__":
-    tracker = GazeTracker()
-    cap = cv2.VideoCapture(0)
-    
-    print("Testing strict gaze tracking. Look straight ahead for 2 seconds to calibrate...")
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-        
-        status, pitch, yaw = tracker.predict(frame)
-        
-        color = (0, 255, 0) if status == "FOCUSED" else (0, 0, 255)
-        if status == "CALIBRATING": color = (0, 255, 255)
-            
-        cv2.putText(frame, f"STATUS: {status}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
-        cv2.putText(frame, f"Pitch: {pitch:.2f} | Yaw: {yaw:.2f}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        cv2.imshow("Strict Gaze Test", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-            
-    cap.release()
-    cv2.destroyAllWindows()
+        # Majority-vote over last 5 frames — require 3/5 to agree.
+        # This suppresses flicker while reacting to real gaze shifts in ~2 frames.
+        self.gaze_history.append(raw)
+        if len(self.gaze_history) > self.history_size:
+            self.gaze_history.pop(0)
+
+        stable = max(set(self.gaze_history), key=self.gaze_history.count)
+        return stable, float(pitch), float(yaw)
