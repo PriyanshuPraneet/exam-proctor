@@ -13,7 +13,7 @@ import ExamTakerPage from './pages/ExamTakerPage';
 import ExamResultsPage from './pages/ExamResultsPage';
 import OrganizerExamPaper from './pages/OrganizerExamPaper';
 import ExamsManagementPage from './pages/ExamsManagementPage';
-
+import CalibrationPage from './pages/CalibrationPage';
 import './App.css';
 
 const API_BASE_URL = 'http://localhost:5000/api';
@@ -100,6 +100,7 @@ function App() {
   return (
     <Router>
       <Routes>
+
         {/* ================= LOGIN ================= */}
         <Route
           path="/login"
@@ -122,8 +123,17 @@ function App() {
           }
         />
 
-        {/* ================= EXAM (CANDIDATE – examCode based) ================= */}
-        {/* 🔑 THIS IS THE FIX */}
+        {/* ================= CALIBRATION (runs before exam) ================= */}
+        <Route
+          path="/calibrate"
+          element={
+            <ProtectedRoute user={user}>
+              <CalibrationPage />
+            </ProtectedRoute>
+          }
+        />
+
+        {/* ================= EXAM (candidate — examCode based) ================= */}
         <Route
           path="/exam"
           element={
@@ -133,7 +143,7 @@ function App() {
           }
         />
 
-        {/* ================= EXAM (OPTIONAL – examId based, future use) ================= */}
+        {/* ================= EXAM (optional — examId based, future use) ================= */}
         <Route
           path="/exam/:examId"
           element={
@@ -183,6 +193,7 @@ function App() {
 
         {/* ================= FALLBACK ================= */}
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
+
       </Routes>
     </Router>
   );

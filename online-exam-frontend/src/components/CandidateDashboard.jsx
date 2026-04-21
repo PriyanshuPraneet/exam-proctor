@@ -57,11 +57,11 @@ const SubmissionDetailModal = ({ submissionId, onClose }) => {
   };
 
   const optionStyle = (option, q) => {
-    const isCorrect = q.type === 'mcq' && option === q.correctAnswer;
+    const isCorrect   = q.type === 'mcq' && option === q.correctAnswer;
     const isCandidate = option === q.candidateAnswer;
 
-    if (isCorrect && isCandidate) return 'bg-green-100 border border-green-400 text-green-800 font-semibold';
-    if (isCorrect) return 'bg-green-50 border border-green-300 text-green-700 font-semibold';
+    if (isCorrect && isCandidate)  return 'bg-green-100 border border-green-400 text-green-800 font-semibold';
+    if (isCorrect)                 return 'bg-green-50 border border-green-300 text-green-700 font-semibold';
     if (isCandidate && !isCorrect) return 'bg-red-100 border border-red-400 text-red-800 line-through';
     return 'bg-white border border-gray-200 text-gray-700';
   };
@@ -220,7 +220,7 @@ const SubmissionDetailModal = ({ submissionId, onClose }) => {
    EXAM CARD
 ========================= */
 const ExamCard = ({ exam, type, onDetailsClick }) => {
-  const navigate = useNavigate();
+  const navigate  = useNavigate();
   const isUpcoming = type === 'upcoming';
 
   const formatDate = (date) =>
@@ -239,13 +239,11 @@ const ExamCard = ({ exam, type, onDetailsClick }) => {
       const token = localStorage.getItem('authToken');
       if (!token) { navigate('/login'); return; }
 
-      await axios.post(
-        `${API_BASE_URL}/start`,
-        { examCode: exam.examCode },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      // ✅ Navigate to CalibrationPage first.
+      // CalibrationPage will collect the 5-point gaze data, then
+      // navigate to /exam carrying { examCode, calibrationData } in state.
+      navigate('/calibrate', { state: { examCode: exam.examCode } });
 
-      navigate('/exam', { state: { examCode: exam.examCode } });
     } catch (err) {
       alert(err.response?.data?.message || 'Unable to start exam at this time.');
     }
@@ -280,7 +278,6 @@ const ExamCard = ({ exam, type, onDetailsClick }) => {
             </span>
           </div>
           <div className="text-right">
-            {/* ✅ Details button now opens the review modal */}
             <button
               className="mt-2 text-xs font-semibold text-gray-600 hover:text-blue-600 flex items-center justify-end ml-auto"
               onClick={() => onDetailsClick(exam._id)}
@@ -336,7 +333,6 @@ const ExamCard = ({ exam, type, onDetailsClick }) => {
 const CandidateDashboard = ({ user, dashboardData, view }) => {
   const { upcomingExams = [], pastSubmissions = [] } = dashboardData || {};
 
-  // Modal state — stores the submissionId to review
   const [detailSubmissionId, setDetailSubmissionId] = useState(null);
 
   return (
@@ -383,42 +379,37 @@ const CandidateDashboard = ({ user, dashboardData, view }) => {
         </section>
       )}
 
-     {/* Past Results Section */}
-{(view === 'dashboard' || view === 'past') && (
-  <section className="pb-10">
-    <div className="flex items-center justify-between mb-6">
-      <h2 className="text-xl font-bold text-gray-800">Academic History</h2>
-    </div>
+      {/* Past Results Section */}
+      {(view === 'dashboard' || view === 'past') && (
+        <section className="pb-10">
+          <div className="flex items-center justify-between mb-6">
+            <h2 className="text-xl font-bold text-gray-800">Academic History</h2>
+          </div>
 
-    {/* 🔥 Scrollable Card Container */}
-    <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
-      
-      {/* Scroll area */}
-      <div className="max-h-[500px] overflow-y-auto pr-2">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-          
-          {pastSubmissions.length > 0 ? (
-            pastSubmissions.map(sub => (
-              <ExamCard
-                key={sub._id}
-                exam={sub}
-                type="past"
-                onDetailsClick={(submissionId) => setDetailSubmissionId(submissionId)}
-              />
-            ))
-          ) : (
-            <div className="col-span-full py-12 bg-gray-50 rounded-2xl flex flex-col items-center justify-center text-gray-400">
-              <p>No past results found.</p>
+          <div className="bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
+            <div className="max-h-[500px] overflow-y-auto pr-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                {pastSubmissions.length > 0 ? (
+                  pastSubmissions.map(sub => (
+                    <ExamCard
+                      key={sub._id}
+                      exam={sub}
+                      type="past"
+                      onDetailsClick={(submissionId) => setDetailSubmissionId(submissionId)}
+                    />
+                  ))
+                ) : (
+                  <div className="col-span-full py-12 bg-gray-50 rounded-2xl flex flex-col items-center justify-center text-gray-400">
+                    <p>No past results found.</p>
+                  </div>
+                )}
+              </div>
             </div>
-          )}
+          </div>
+        </section>
+      )}
 
-        </div>
-      </div>
-    </div>
-  </section>
-)}
-
-      {/* ✅ Submission Detail Modal */}
+      {/* Submission Detail Modal */}
       {detailSubmissionId && (
         <SubmissionDetailModal
           submissionId={detailSubmissionId}
